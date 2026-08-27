@@ -6,6 +6,7 @@ import WebSocket from "ws";
 
 import { allocateTcpPort, resolveCodexEntrypoint, waitForHttpReady } from "../src/launcher-support.mjs";
 import { createWatchdogProxy } from "../src/proxy.mjs";
+import { analyzeCodexQuota } from "../src/quota.mjs";
 
 function waitForOpen(socket) {
   return new Promise((resolve, reject) => {
@@ -95,6 +96,16 @@ try {
   assert.equal(typeof result.userAgent, "string");
   client.send(JSON.stringify({ method: "initialized", params: {} }));
 
+  const rateLimits = waitForResponse(client, "live-rate-limits");
+  client.send(
+    JSON.stringify({
+      method: "account/rateLimits/read",
+      id: "live-rate-limits",
+    }),
+  );
+  const quota = analyzeCodexQuota(await rateLimits);
+  assert.equal(quota.known, true);
+
   const interruptError = waitForResponse(client, "live-interrupt");
   client.send(
     JSON.stringify({
@@ -120,7 +131,9 @@ try {
     assert.notEqual(error.code, -32601);
     return true;
   });
-  process.stdout.write("live app-server websocket, turn/interrupt, and compact smoke passed\n");
+  process.stdout.write(
+    "live app-server websocket, rate limits, turn/interrupt, and compact smoke passed\n",
+  );
 } finally {
   client?.close();
   if (proxy) await proxy.close();

@@ -15,9 +15,14 @@ Codex Goal Watchdog 是一个本地启动器，用来降低 Codex `/goal` 因短
 - 重试长时间没有恢复时，中断该 turn 一次，并在确认 goal 状态后继续运行。
 - 终态瞬时错误已经把 goal 置为 `blocked` 时，按退避时间重新激活同一个 goal。
 - 上下文窗口耗尽时，先压缩原 thread，再恢复同一个 goal。
+- ChatGPT/Codex usage-limit 窗口耗尽时，读取 app-server 返回的实际窗口和 reset 时间，
+  等待官方额度恢复后再激活同一个 thread 的同一个 goal。
 - 本地 app-server 异常退出时，在原地址按封顶退避重启，并保持当前 TUI 与 proxy 的连接。
 
-它不会绕过人工暂停、认证失败、用量限制、token budget、额度不足或已经完成的 goal。
+这不是绕过配额限制。watchdog 在官方额度恢复前不会为该 goal 发送新的执行请求，只会低频
+读取额度状态；恢复后也会重新读取 goal，确认它仍为 `usageLimited` 或 `quotaExhausted` 才会
+设回 `active`。人工暂停、认证失败、`budgetLimited`、API billing 的
+`insufficient_quota`/credit exhausted，以及已经完成的 goal 都不会被自动恢复。
 
 ## 环境要求
 
@@ -88,12 +93,16 @@ codex-watchdog resume --all
 | `CODEX_WATCHDOG_CODEX_JS` | 指定 Codex 的 `codex.js` 入口 | 自动查找全局 npm 安装 |
 | `CODEX_WATCHDOG_DELAYS_MS` | 逗号分隔的恢复退避时间，单位毫秒 | `30000,60000,120000,300000` |
 | `CODEX_WATCHDOG_INTERRUPT_AFTER_MS` | Codex 持续重试多久后允许中断当前 turn | `120000` |
+| `CODEX_WATCHDOG_QUOTA_POLL_MS` | quota 数据未知、缺少 reset 时间或查询暂时失败时的轮询间隔 | `60000` |
+| `CODEX_WATCHDOG_QUOTA_RESET_GRACE_MS` | 官方 reset 时间之后额外等待的边界宽限 | `10000` |
 
 临时缩短退避时间进行测试：
 
 ```powershell
 $env:CODEX_WATCHDOG_DELAYS_MS = "1000,2000,5000"
 $env:CODEX_WATCHDOG_INTERRUPT_AFTER_MS = "10000"
+$env:CODEX_WATCHDOG_QUOTA_POLL_MS = "5000"
+$env:CODEX_WATCHDOG_QUOTA_RESET_GRACE_MS = "1000"
 ```
 
 ## 工作原理
@@ -106,6 +115,8 @@ Codex TUI -> watchdog WebSocket proxy -> Codex app-server -> provider
 事件。恢复期间只会按需发送以下内部请求：
 
 - `thread/goal/get`：恢复前重新读取 goal 状态。
+- `account/rateLimits/read`：读取 Codex quota 窗口的 `usedPercent`、
+  `windowDurationMins` 和服务端 `resetsAt`。
 - `turn/interrupt`：仍在重试且超过宽限期时，对同一 turn 最多发送一次。
 - `thread/compact/start`：上下文耗尽时压缩原 thread。
 - `thread/goal/set`：turn 结束或压缩完成后，把可恢复的 goal 设回 `active`。
@@ -148,8 +159,9 @@ npm run test:live
 ```
 
 live test 会启动本机已安装的 Codex app-server，确认 WebSocket 初始化、
-`turn/interrupt` 和 `thread/compact/start` 方法仍然存在。它不会制造真实 provider 故障，
-也不会覆盖 `thread/goal/*` 和全部通知结构，因此不能单独作为版本兼容证明。
+`account/rateLimits/read`、`turn/interrupt` 和 `thread/compact/start` 方法仍然存在，并确认
+当前 rate-limit 返回结构可以由 watchdog 解析。它不会消耗额度、修改用户 Goal 或制造真实
+provider 故障，也不会覆盖 `thread/goal/*` 和全部通知结构，因此不能单独作为版本兼容证明。
 
 `npm run test:cli` 还会打包并安装当前仓库，用 fake app-server 验证进程崩溃后能在原地址
 换代，TUI WebSocket 保持连接，并在重新握手后继续收发请求。

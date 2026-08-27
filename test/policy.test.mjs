@@ -46,6 +46,10 @@ test("classifies provider 429 after retry exhaustion as transient", () => {
       info: "other",
       message: "exceeded retry limit, last status: 429 Too Many Requests, request id: test-request",
     }),
+    errorNotification({
+      info: "other",
+      message: "429 Too Many Requests: provider usage limit reached",
+    }),
   ];
 
   for (const notification of notifications) {
@@ -75,6 +79,47 @@ test("does not retry structured 429 when the provider reports exhausted quota", 
       reason: "permanent-error-message",
       statusCode: null,
     });
+    assert.notEqual(
+      classifyTerminalError(notification).recoveryAction,
+      "waitForQuota",
+    );
+  }
+});
+
+test("waits for ChatGPT usage-limit errors to recover", () => {
+  const notifications = [
+    errorNotification({ info: "usageLimitExceeded", message: "provider error" }),
+    errorNotification({ info: "other", message: "usage limit reached" }),
+    errorNotification({ info: "other", message: "goal is usageLimited" }),
+    errorNotification({ info: "other", message: "goal is quotaExhausted" }),
+  ];
+
+  for (const notification of notifications) {
+    assert.deepEqual(classifyTerminalError(notification), {
+      transient: false,
+      reason: "usage-limit-exceeded",
+      statusCode: null,
+      recoveryAction: "waitForQuota",
+    });
+  }
+});
+
+test("does not wait for API billing or credit exhaustion", () => {
+  const messages = [
+    "429 insufficient_quota",
+    "API billing exhausted",
+    "credit exhausted",
+    "401 authentication failed",
+    "403 forbidden",
+    "400 bad request",
+  ];
+
+  for (const message of messages) {
+    const classification = classifyTerminalError(
+      errorNotification({ info: "other", message }),
+    );
+    assert.equal(classification.transient, false);
+    assert.notEqual(classification.recoveryAction, "waitForQuota");
   }
 });
 
@@ -148,6 +193,11 @@ test("retries only transient compact request failures", () => {
   assert.deepEqual(classifyRecoveryRequestError(new Error("invalid request")), {
     retry: false,
     reason: "permanent-recovery-request",
+  });
+
+  assert.deepEqual(classifyRecoveryRequestError(new Error("app-server disconnected")), {
+    retry: true,
+    reason: "transient-recovery-request",
   });
 });
 
