@@ -1,14 +1,18 @@
 import { classifyRecoveryRequestError, classifyTerminalError } from "./policy.mjs";
+import {
+  analyzeCodexQuota,
+  nextQuotaCheckDelayMs,
+  quotaWindowLabel,
+} from "./quota.mjs";
 
 const STOPPED_GOAL_STATUSES = new Set([
   "paused",
-  "usageLimited",
   "budgetLimited",
-  "quotaExhausted",
   "authenticationFailed",
   "unauthorized",
   "complete",
 ]);
+const QUOTA_LIMITED_GOAL_STATUSES = new Set(["usageLimited", "quotaExhausted"]);
 const INTERRUPTABLE_GOAL_STATUSES = new Set(["active"]);
 const RESUMABLE_GOAL_STATUSES = new Set(["active", "blocked"]);
 
@@ -19,6 +23,7 @@ function newThreadState() {
     interruptAttempts: new Set(),
     compactionAttempts: new Set(),
     compactedTurns: new Set(),
+    quotaLimited: false,
     pending: null,
     activeTurnId: null,
     interruptingTurnId: null,
@@ -31,6 +36,8 @@ export class GoalWatchdogController {
     sendRequest,
     delaysMs = [30_000, 60_000, 120_000, 300_000],
     interruptAfterMs = 120_000,
+    quotaPollMs = 60_000,
+    quotaResetGraceMs = 10_000,
     schedule = setTimeout,
     cancel = clearTimeout,
     logger = console,
@@ -41,9 +48,17 @@ export class GoalWatchdogController {
     if (!Number.isFinite(interruptAfterMs) || interruptAfterMs < 0) {
       throw new Error("interruptAfterMs must be a non-negative number");
     }
+    if (!Number.isFinite(quotaPollMs) || quotaPollMs < 0) {
+      throw new Error("quotaPollMs must be a non-negative number");
+    }
+    if (!Number.isFinite(quotaResetGraceMs) || quotaResetGraceMs < 0) {
+      throw new Error("quotaResetGraceMs must be a non-negative number");
+    }
     this.sendRequest = sendRequest;
     this.delaysMs = delaysMs;
     this.interruptAfterMs = interruptAfterMs;
+    this.quotaPollMs = quotaPollMs;
+    this.quotaResetGraceMs = quotaResetGraceMs;
     this.schedule = schedule;
     this.cancel = cancel;
     this.logger = logger;
@@ -51,6 +66,10 @@ export class GoalWatchdogController {
   }
 
   handleNotification(message) {
+    if (message?.method === "account/rateLimits/updated") {
+      this.#wakeQuotaWaiters();
+      return;
+    }
     if (message?.method === "error") {
       this.#handleError(message);
       return;
@@ -100,7 +119,12 @@ export class GoalWatchdogController {
     const turnId = params.turnId ?? params.turn?.id;
     if (!threadId || !turnId) return;
 
-    const state = this.#state(threadId);
+    let state = this.#state(threadId);
+    if (state.quotaLimited) {
+      this.#resetThread(threadId);
+      state = this.#state(threadId);
+      this.logger.info(`Cancelled quota wait for ${threadId}: new turn ${turnId} started`);
+    }
     if (["compact-request", "compact-wait"].includes(state.pending?.kind)) {
       if (
         state.pending.compactionTurnId &&
@@ -149,6 +173,20 @@ export class GoalWatchdogController {
 
   #handleError(message) {
     const classification = classifyTerminalError(message);
+    if (classification.recoveryAction === "waitForQuota") {
+      const { threadId, turnId } = message.params ?? {};
+      if (!threadId) {
+        this.logger.warn("Ignored usage-limit error without threadId");
+        return;
+      }
+      const state = this.#state(threadId);
+      if (state.activeTurnId && turnId && state.activeTurnId !== turnId) {
+        this.logger.info(`Ignored stale usage-limit error for ${threadId}/${turnId}`);
+        return;
+      }
+      this.#startQuotaWait(threadId, state, turnId);
+      return;
+    }
     if (classification.recoveryAction === "compact") {
       const { threadId, turnId } = message.params ?? {};
       if (threadId && turnId) {
@@ -208,6 +246,10 @@ export class GoalWatchdogController {
     if (!threadId || !status) return;
 
     const state = this.#state(threadId);
+    if (QUOTA_LIMITED_GOAL_STATUSES.has(status)) {
+      this.#startQuotaWait(threadId, state, turnId);
+      return;
+    }
     if (status === "blocked" && turnId) {
       this.#cancelPending(state, "interrupt");
       state.blockedTurns.add(turnId);
@@ -216,6 +258,11 @@ export class GoalWatchdogController {
     }
 
     if (status === "active") {
+      if (state.quotaLimited) {
+        this.#resetThread(threadId);
+        this.logger.info(`Cancelled quota wait for ${threadId}: goal became active`);
+        return;
+      }
       if (state.pending?.kind === "resume" && state.pending.requireBlocked) {
         this.#cancelPending(state, "resume", "blocked goal became active");
       }
@@ -269,6 +316,106 @@ export class GoalWatchdogController {
     state.interruptAttempts.clear();
     state.compactionAttempts.clear();
     state.compactedTurns.clear();
+    state.quotaLimited = false;
+  }
+
+  #startQuotaWait(threadId, state, turnId = null) {
+    if (this.threads.get(threadId) !== state) return;
+    if (state.pending?.kind === "quota") {
+      state.quotaLimited = true;
+      return;
+    }
+    this.#cancelPending(state);
+    state.quotaLimited = true;
+    this.#scheduleQuotaCheck(threadId, state, 0, turnId);
+    this.logger.info(`Goal ${threadId} reached a usage limit; checking quota availability`);
+  }
+
+  #scheduleQuotaCheck(threadId, state, delayMs, turnId = null) {
+    if (
+      state.pending ||
+      !state.quotaLimited ||
+      this.threads.get(threadId) !== state
+    ) return;
+    const pending = {
+      kind: "quota",
+      threadId,
+      handle: null,
+      cancelled: false,
+      turnId,
+    };
+    pending.handle = this.schedule(async () => {
+      if (!this.#isCurrentPending(threadId, state, pending)) return;
+      await this.#checkQuotaAndMaybeResume(threadId, state, pending);
+    }, delayMs);
+    state.pending = pending;
+  }
+
+  async #checkQuotaAndMaybeResume(threadId, state, pending) {
+    try {
+      const response = await this.sendRequest("account/rateLimits/read");
+      if (!this.#isCurrentPending(threadId, state, pending)) return;
+      const analysis = analyzeCodexQuota(response);
+
+      if (!analysis.available) {
+        const delayMs = nextQuotaCheckDelayMs(analysis, {
+          pollMs: this.quotaPollMs,
+          resetGraceMs: this.quotaResetGraceMs,
+        });
+        this.#releasePending(state, pending);
+        this.#scheduleQuotaCheck(threadId, state, delayMs, pending.turnId);
+        if (analysis.known) {
+          const windows = analysis.exhaustedWindows.map(quotaWindowLabel).join(", ");
+          this.logger.info(
+            `Quota remains exhausted for ${threadId} (${windows}); check in ${delayMs}ms`,
+          );
+        } else {
+          this.logger.warn(`Quota data is unknown for ${threadId}; check in ${delayMs}ms`);
+        }
+        return;
+      }
+
+      const goalResponse = await this.sendRequest("thread/goal/get", { threadId });
+      if (!this.#isCurrentPending(threadId, state, pending)) return;
+      const status = goalResponse?.goal?.status;
+      if (!QUOTA_LIMITED_GOAL_STATUSES.has(status)) {
+        this.#releasePending(state, pending);
+        state.quotaLimited = false;
+        this.#resetThread(threadId);
+        this.logger.info(
+          `Goal ${threadId} is ${status ?? "unknown"}; quota auto-resume cancelled`,
+        );
+        return;
+      }
+
+      await this.sendRequest("thread/goal/set", { threadId, status: "active" });
+      if (!this.#isCurrentPending(threadId, state, pending)) return;
+      this.#releasePending(state, pending);
+      state.quotaLimited = false;
+      state.attempt = 0;
+      this.logger.info(`Official quota recovered; goal ${threadId} resumed automatically`);
+    } catch (error) {
+      if (!this.#isCurrentPending(threadId, state, pending)) return;
+      this.#releasePending(state, pending);
+      const classification = classifyRecoveryRequestError(error);
+      this.logger.error(
+        `Failed to check quota or resume ${threadId}: ${classification.reason}: ${error.message}`,
+      );
+      if (!classification.retry) {
+        this.#resetThread(threadId);
+        return;
+      }
+      this.#scheduleQuotaCheck(threadId, state, this.quotaPollMs, pending.turnId);
+    }
+  }
+
+  #wakeQuotaWaiters() {
+    for (const [threadId, state] of this.threads) {
+      if (!state.quotaLimited) continue;
+      const turnId = state.pending?.turnId ?? null;
+      this.#cancelPending(state, "quota", "rate-limit update received");
+      this.#scheduleQuotaCheck(threadId, state, 0, turnId);
+    }
   }
 
   #scheduleCompaction(threadId, turnId, state, retry = false) {
@@ -296,6 +443,11 @@ export class GoalWatchdogController {
       const before = await this.sendRequest("thread/goal/get", { threadId });
       if (!this.#isCurrentPending(threadId, state, pending)) return;
       const beforeStatus = before?.goal?.status;
+      if (QUOTA_LIMITED_GOAL_STATUSES.has(beforeStatus)) {
+        this.#releasePending(state, pending);
+        this.#startQuotaWait(threadId, state, turnId);
+        return;
+      }
       if (STOPPED_GOAL_STATUSES.has(beforeStatus)) {
         this.#releasePending(state, pending);
         return;
@@ -375,6 +527,11 @@ export class GoalWatchdogController {
     try {
       const after = await this.sendRequest("thread/goal/get", { threadId });
       if (!this.#isCurrentPending(threadId, state, pending)) return;
+      if (QUOTA_LIMITED_GOAL_STATUSES.has(after?.goal?.status)) {
+        this.#releasePending(state, pending);
+        this.#startQuotaWait(threadId, state, turnId);
+        return;
+      }
       if (after?.goal?.status === "blocked") {
         await this.sendRequest("thread/goal/set", { threadId, status: "active" });
       }
@@ -502,6 +659,11 @@ export class GoalWatchdogController {
       }
 
       const status = response?.goal?.status;
+      if (QUOTA_LIMITED_GOAL_STATUSES.has(status)) {
+        this.#releasePending(state, pending);
+        this.#startQuotaWait(threadId, state, turnId);
+        return;
+      }
       const canResume = requireBlocked
         ? status === "blocked"
         : RESUMABLE_GOAL_STATUSES.has(status);

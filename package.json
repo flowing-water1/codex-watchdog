@@ -15,7 +15,7 @@
     "test": "node --test test/*.test.mjs",
     "test:cli": "node test/installed-cli.mjs",
     "test:live": "node test/live-app-server.mjs",
-    "check": "node --check src/controller.mjs && node --check src/launcher-support.mjs && node --check src/launcher.mjs && node --check src/policy.mjs && node --check src/proxy.mjs && node --check src/rpc-channel.mjs && node --check src/standard-runtime.mjs"
+    "check": "node --check src/controller.mjs && node --check src/launcher-support.mjs && node --check src/launcher.mjs && node --check src/policy.mjs && node --check src/proxy.mjs && node --check src/quota.mjs && node --check src/rpc-channel.mjs && node --check src/standard-runtime.mjs"
   },
   "keywords": [
     "codex",

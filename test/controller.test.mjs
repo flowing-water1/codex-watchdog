@@ -18,7 +18,10 @@ function createHarness({
   goalGetResponses = [],
   goalSetResponses = [],
   compactResponses = [],
+  quotaResponses = [],
   interruptAfterMs = 120_000,
+  quotaPollMs = 60_000,
+  quotaResetGraceMs = 10_000,
 } = {}) {
   const requests = [];
   const timers = [];
@@ -29,8 +32,22 @@ function createHarness({
   const controller = new GoalWatchdogController({
     delaysMs: [30_000, 60_000, 120_000],
     interruptAfterMs,
+    quotaPollMs,
+    quotaResetGraceMs,
     sendRequest: async (method, params) => {
       requests.push({ method, params });
+      if (method === "account/rateLimits/read") {
+        if (quotaResponses.length > 0) {
+          const response = quotaResponses.shift();
+          if (response instanceof Error) throw response;
+          return response;
+        }
+        return {
+          rateLimitsByLimitId: {
+            codex: { primary: { usedPercent: 0, windowDurationMins: 300 } },
+          },
+        };
+      }
       if (method === "thread/goal/get") {
         if (goalGetResponses.length > 0) {
           const response = goalGetResponses.shift();
@@ -138,6 +155,186 @@ function completedItem(turnId = "turn-1") {
     },
   };
 }
+
+function quotaResponse(usedPercent, resetsAt = null) {
+  return {
+    rateLimitsByLimitId: {
+      codex: {
+        primary: { usedPercent, windowDurationMins: 300, resetsAt },
+        secondary: null,
+      },
+    },
+  };
+}
+
+function usageLimitError() {
+  return {
+    method: "error",
+    params: {
+      threadId: "thread-1",
+      turnId: "turn-1",
+      willRetry: false,
+      error: {
+        message: "usage limit reached",
+        codexErrorInfo: "usageLimitExceeded",
+        additionalDetails: null,
+      },
+    },
+  };
+}
+
+test("keeps an exhausted usage-limited goal waiting for quota", async () => {
+  const { controller, timers, requests } = createHarness({
+    goalStatus: "usageLimited",
+    quotaResponses: [quotaResponse(100)],
+    quotaPollMs: 5_000,
+  });
+
+  controller.handleNotification(blockedGoal("usageLimited"));
+  assert.equal(timers[0].delayMs, 0);
+  await timers[0].callback();
+
+  assert.deepEqual(requests.map(({ method }) => method), ["account/rateLimits/read"]);
+  assert.equal(timers[1].delayMs, 5_000);
+  assert.equal(
+    requests.some(({ method }) => method === "thread/goal/set"),
+    false,
+  );
+});
+
+test("reactivates the same usage-limited goal after quota is available", async () => {
+  const { controller, timers, requests, goals } = createHarness({
+    goalStatus: "usageLimited",
+    quotaResponses: [quotaResponse(99)],
+  });
+
+  controller.handleNotification(blockedGoal("usageLimited"));
+  await timers[0].callback();
+
+  assert.deepEqual(requests.map(({ method }) => method), [
+    "account/rateLimits/read",
+    "thread/goal/get",
+    "thread/goal/set",
+  ]);
+  assert.deepEqual(requests.at(-1), {
+    method: "thread/goal/set",
+    params: { threadId: "thread-1", status: "active" },
+  });
+  assert.equal(goals.get("thread-1").status, "active");
+});
+
+test("never reactivates a paused goal when quota is available", async () => {
+  const { controller, timers, requests } = createHarness({
+    goalStatus: "paused",
+    quotaResponses: [quotaResponse(0)],
+  });
+
+  controller.handleNotification(blockedGoal("usageLimited"));
+  await timers[0].callback();
+
+  assert.deepEqual(requests.map(({ method }) => method), [
+    "account/rateLimits/read",
+    "thread/goal/get",
+  ]);
+});
+
+test("cancels quota waiting when a new turn starts", async () => {
+  const { controller, timers, requests, cancelled } = createHarness({
+    goalStatus: "usageLimited",
+  });
+
+  controller.handleNotification(blockedGoal("usageLimited"));
+  controller.handleNotification({
+    method: "turn/started",
+    params: {
+      threadId: "thread-1",
+      turn: { id: "turn-new", status: "inProgress" },
+    },
+  });
+
+  assert.equal(cancelled.length, 1);
+  assert.equal(timers[0].cancelled, true);
+  await timers[0].callback();
+  assert.deepEqual(requests, []);
+});
+
+test("cancels quota waiting when the goal becomes active", async () => {
+  const { controller, timers, requests, cancelled } = createHarness({
+    goalStatus: "usageLimited",
+  });
+
+  controller.handleNotification(blockedGoal("usageLimited"));
+  controller.handleNotification(blockedGoal("active"));
+
+  assert.equal(cancelled.length, 1);
+  assert.equal(timers[0].cancelled, true);
+  await timers[0].callback();
+  assert.deepEqual(requests, []);
+});
+
+test("continues polling after a transient quota lookup failure", async () => {
+  const error = new Error("503 Service Unavailable");
+  error.code = 503;
+  const { controller, timers, requests } = createHarness({
+    goalStatus: "usageLimited",
+    quotaResponses: [error],
+    quotaPollMs: 7_500,
+  });
+
+  controller.handleNotification(blockedGoal("usageLimited"));
+  await timers[0].callback();
+
+  assert.deepEqual(requests.map(({ method }) => method), ["account/rateLimits/read"]);
+  assert.equal(timers[1].delayMs, 7_500);
+});
+
+test("stops quota recovery after an authentication failure", async () => {
+  const error = new Error("401 authentication failed");
+  error.code = 401;
+  const { controller, timers, requests, logs } = createHarness({
+    goalStatus: "usageLimited",
+    quotaResponses: [error],
+  });
+
+  controller.handleNotification(blockedGoal("usageLimited"));
+  await timers[0].callback();
+
+  assert.deepEqual(requests.map(({ method }) => method), ["account/rateLimits/read"]);
+  assert.equal(timers.length, 1);
+  assert.equal(logs.some(({ message }) => message.includes("authentication-failed")), true);
+});
+
+test("enters quota waiting from a structured usage-limit error", async () => {
+  const { controller, timers, requests } = createHarness({
+    goalStatus: "usageLimited",
+    quotaResponses: [quotaResponse(100)],
+  });
+
+  controller.handleNotification(usageLimitError());
+  assert.equal(timers[0].delayMs, 0);
+  await timers[0].callback();
+  assert.deepEqual(requests.map(({ method }) => method), ["account/rateLimits/read"]);
+});
+
+test("rate-limit update notifications wake quota waiters immediately", async () => {
+  const { controller, timers } = createHarness({
+    goalStatus: "usageLimited",
+    quotaResponses: [quotaResponse(100)],
+    quotaPollMs: 60_000,
+  });
+
+  controller.handleNotification(blockedGoal("usageLimited"));
+  await timers[0].callback();
+  assert.equal(timers[1].delayMs, 60_000);
+
+  controller.handleNotification({
+    method: "account/rateLimits/updated",
+    params: { rateLimits: { primary: { usedPercent: 99 } } },
+  });
+
+  assert.equal(timers[1].cancelled, true);
+  assert.equal(timers[2].delayMs, 0);
+});
 
 test("correlates terminal error and blocked goal in either event order", () => {
   for (const events of [

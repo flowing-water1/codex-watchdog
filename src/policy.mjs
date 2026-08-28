@@ -6,10 +6,14 @@ const CONNECTION_FAILURE_KEYS = new Map([
   ["responseTooManyFailedAttempts", "response-too-many-failed-attempts"],
 ]);
 
+const NON_RECOVERABLE_MESSAGE_PATTERN =
+  /\b(?:insufficient[_ -]?quota|api billing|billing (?:exhaust|deplet)|credit.?exhaust|credit.?deplet|unauthori[sz]ed|forbidden|bad request|invalid request|authentication|401|403)\b/i;
+const USAGE_LIMIT_MESSAGE_PATTERN =
+  /\b(?:usageLimitExceeded|usageLimited|quotaExhausted|usage[ _-]?limit(?: (?:reached|exceeded))?)\b/i;
 const PERMANENT_MESSAGE_PATTERN =
-  /\b(?:compact(?:ion)?|context window|usage limit|quota|credit.?exhaust|insufficient[_ -]?quota|unauthori[sz]ed|forbidden|bad request|invalid request|authentication)\b/i;
+  /\b(?:compact(?:ion)?|context window|quota|billing|credit|unauthori[sz]ed|forbidden|bad request|invalid request|authentication)\b/i;
 const TRANSIENT_MESSAGE_PATTERN =
-  /\b(?:service unavailable|bad gateway|gateway timeout|connection (?:reset|refused)|network (?:error|failure)|timed? out|stream (?:closed|disconnected))\b/i;
+  /\b(?:service unavailable|bad gateway|gateway timeout|connection (?:reset|refused)|network (?:error|failure)|timed? out|stream (?:closed|disconnected)|app-server (?:websocket )?disconnected|websocket is not open)\b/i;
 
 function result(transient, reason, statusCode = null, willRetry = false) {
   const classification = { transient, reason, statusCode };
@@ -28,6 +32,15 @@ function compactRecovery() {
     reason: "context-window-exhausted",
     statusCode: null,
     recoveryAction: "compact",
+  };
+}
+
+function quotaRecovery() {
+  return {
+    transient: false,
+    reason: "usage-limit-exceeded",
+    statusCode: null,
+    recoveryAction: "waitForQuota",
   };
 }
 
@@ -64,15 +77,22 @@ export function classifyTerminalError(notification) {
   if (/ran out of room in the model'?s context window|context window exceeded/i.test(message)) {
     return compactRecovery();
   }
-  if (PERMANENT_MESSAGE_PATTERN.test(message)) {
+  if (NON_RECOVERABLE_MESSAGE_PATTERN.test(message)) {
     return result(false, "permanent-error-message");
   }
+  if (info === "usageLimitExceeded") return quotaRecovery();
 
   const structured = structuredConnectionFailure(info);
   if (structured) return markCodexRetry(structured, willRetry);
 
   if (info === "serverOverloaded") {
     return result(true, "server-overloaded", null, willRetry);
+  }
+
+  const hasProvider429 = /(?:^|\D)429(?:\D|$)/.test(message);
+  if (USAGE_LIMIT_MESSAGE_PATTERN.test(message) && !hasProvider429) return quotaRecovery();
+  if (PERMANENT_MESSAGE_PATTERN.test(message)) {
+    return result(false, "permanent-error-message");
   }
 
   const httpMatch = message.match(/(?:^|\D)(429|502|503|504)(?:\D|$)/);

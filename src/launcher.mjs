@@ -18,6 +18,8 @@ import { superviseStandardRuntime, terminateChild } from "./standard-runtime.mjs
 const projectRoot = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const DEFAULT_DELAYS_MS = [30_000, 60_000, 120_000, 300_000];
 const DEFAULT_INTERRUPT_AFTER_MS = 120_000;
+const DEFAULT_QUOTA_POLL_MS = 60_000;
+const DEFAULT_QUOTA_RESET_GRACE_MS = 10_000;
 
 function parseDelays(value) {
   if (!value) return DEFAULT_DELAYS_MS;
@@ -74,6 +76,16 @@ async function main() {
       DEFAULT_INTERRUPT_AFTER_MS,
       "CODEX_WATCHDOG_INTERRUPT_AFTER_MS",
     );
+    const quotaPollMs = parseNonNegativeMilliseconds(
+      process.env.CODEX_WATCHDOG_QUOTA_POLL_MS,
+      DEFAULT_QUOTA_POLL_MS,
+      "CODEX_WATCHDOG_QUOTA_POLL_MS",
+    );
+    const quotaResetGraceMs = parseNonNegativeMilliseconds(
+      process.env.CODEX_WATCHDOG_QUOTA_RESET_GRACE_MS,
+      DEFAULT_QUOTA_RESET_GRACE_MS,
+      "CODEX_WATCHDOG_QUOTA_RESET_GRACE_MS",
+    );
     const forwardedArgs = process.argv.slice(2);
     validateForwardedArgs(forwardedArgs);
     const launchCwd = process.cwd();
@@ -104,6 +116,8 @@ async function main() {
       upstreamUrl: appServerUrl,
       delaysMs,
       interruptAfterMs,
+      quotaPollMs,
+      quotaResetGraceMs,
       logger,
     });
 

@@ -28,6 +28,8 @@ export async function createWatchdogProxy({
   upstreamUrl,
   delaysMs,
   interruptAfterMs,
+  quotaPollMs,
+  quotaResetGraceMs,
   upstreamConnectDelaysMs = [100, 250, 500, 1_000, 2_000, 5_000],
   logger = console,
 }) {
@@ -78,6 +80,8 @@ export async function createWatchdogProxy({
       sendRequest: (method, params) => rpc.request(method, params),
       delaysMs,
       interruptAfterMs,
+      quotaPollMs,
+      quotaResetGraceMs,
       logger,
     });
 
