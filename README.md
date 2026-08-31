@@ -1,3 +1,5 @@
+
+
 # Codex Goal Watchdog
 
 Codex Goal Watchdog 是一个本地启动器，用来降低 Codex `/goal` 因短暂网络故障、上游
@@ -149,6 +151,7 @@ watchdog 只监听 `127.0.0.1`，不提供远程服务，也不接管 Codex 的�
 
 ```bash
 npm test
+npm run test:cli
 npm run check
 ```
 
@@ -181,5 +184,3 @@ docs/adr/   架构决策记录
 ## 许可证
 
 本项目使用 [MIT License](LICENSE)。
-
-
